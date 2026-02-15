@@ -1,5 +1,6 @@
+import os
 from pathlib import Path
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
@@ -10,11 +11,14 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-MODEL = "gpt-4.1-nano"
+# Groq API (free tier): GPT-OSS 120B — uses GROQ_API_KEY from .env
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+MODEL = "openai/gpt-oss-120b"
 DB_NAME = str(Path(__file__).parent.parent / "vector_db")
 
-# embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+# Free embeddings (no API key). Must match ingest.py; re-run ingest if you change.
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 RETRIEVAL_K = 10
 
 SYSTEM_PROMPT = """
@@ -28,7 +32,12 @@ Context:
 
 vectorstore = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
 retriever = vectorstore.as_retriever()
-llm = ChatOpenAI(temperature=0, model_name=MODEL)
+llm = ChatOpenAI(
+    base_url=GROQ_BASE_URL,
+    api_key=os.getenv("GROQ_API_KEY"),
+    model=MODEL,
+    temperature=0,
+)
 
 
 def fetch_context(question: str) -> list[Document]:

@@ -1,7 +1,10 @@
 import sys
 import math
+import re
+import time
 from pydantic import BaseModel, Field
 from litellm import completion
+from litellm.exceptions import RateLimitError
 from dotenv import load_dotenv
 
 from evaluation.test import TestQuestion, load_tests
@@ -10,8 +13,11 @@ from implementation.answer import answer_question, fetch_context
 
 load_dotenv(override=True)
 
-MODEL = "gpt-4.1-nano"
+# Answer evaluation (LLM-as-judge): Groq — same as RAG in answer.py
+JUDGE_MODEL = "groq/openai/gpt-oss-120b"
 db_name = "vector_db"
+RATE_LIMIT_RETRY_DELAY = 2.5
+RATE_LIMIT_MAX_RETRIES = 6
 
 
 class RetrievalEval(BaseModel):
@@ -39,6 +45,38 @@ class AnswerEval(BaseModel):
     relevance: float = Field(
         description="How relevant is the answer to the specific question asked? 1 (very poor - off-topic) to 5 (ideal - directly addresses question and gives no additional information). Only answer 5 if the answer is completely relevant to the question and gives no additional information."
     )
+
+
+def _parse_judge_json(content: str) -> AnswerEval:
+    """Extract JSON from judge response (model may return plain text or markdown)."""
+    content = content.strip()
+    # Try raw JSON first
+    try:
+        return AnswerEval.model_validate_json(content)
+    except Exception:
+        pass
+    # Strip markdown code block if present
+    match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, re.DOTALL)
+    if match:
+        try:
+            return AnswerEval.model_validate_json(match.group(1).strip())
+        except Exception:
+            pass
+    # Find first { and matching } by brace count (feedback may contain braces)
+    start = content.find("{")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(content)):
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return AnswerEval.model_validate_json(content[start : i + 1])
+                    except Exception:
+                        break
+    raise ValueError(f"Could not parse AnswerEval JSON from response: {content[:500]}...")
 
 
 def calculate_mrr(keyword: str, retrieved_docs: list) -> float:
@@ -115,13 +153,14 @@ def evaluate_retrieval(test: TestQuestion, k: int = 10) -> RetrievalEval:
 
 def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval, str, list]:
     """
-    Evaluate answer quality using LLM-as-a-judge (async).
+    Evaluate answer quality using LLM-as-a-judge (async) and provide short explanation for scores.
 
     Args:
         test: TestQuestion object containing question and reference answer
 
     Returns:
         Tuple of (AnswerEval object, generated_answer string, retrieved_docs list)
+        - AnswerEval now includes 'feedback' with reasoning for the scores
     """
     # Get RAG response using shared answer module
     generated_answer, retrieved_docs = answer_question(test.question)
@@ -130,7 +169,11 @@ def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval, str, list]:
     judge_messages = [
         {
             "role": "system",
-            "content": "You are an expert evaluator assessing the quality of answers. Evaluate the generated answer by comparing it to the reference answer. Only give 5/5 scores for perfect answers.",
+            "content": (
+                "You are an expert evaluator assessing the quality of answers. "
+                "Evaluate the generated answer by comparing it to the reference answer. "
+                "Only give 5/5 scores for perfect answers."
+            ),
         },
         {
             "role": "user",
@@ -143,21 +186,40 @@ Generated Answer:
 Reference Answer:
 {test.reference_answer}
 
-Please evaluate the generated answer on three dimensions:
+Please evaluate the generated answer on three dimensions and give a short explanation for each score:
 1. Accuracy: How factually correct is it compared to the reference answer? Only give 5/5 scores for perfect answers.
 2. Completeness: How thoroughly does it address all aspects of the question, covering all the information from the reference answer?
 3. Relevance: How well does it directly answer the specific question asked, giving no additional information?
 
-Provide detailed feedback and scores from 1 (very poor) to 5 (ideal) for each dimension. If the answer is wrong, then the accuracy score must be 1.""",
+If the answer is wrong, then the accuracy score must be 1.
+
+Respond with ONLY a single JSON object (no markdown, no explanation) with exactly these keys:
+"feedback" (string explaining the scores), 
+"accuracy" (number 1-5), 
+"completeness" (number 1-5), 
+"relevance" (number 1-5). 
+
+Example:
+{{"feedback": "Accuracy is high but completeness missed two points, relevance is perfect", "accuracy": 4, "completeness": 3, "relevance": 5}}"""
         },
     ]
 
-    # Call LLM judge with structured outputs (async)
-    judge_response = completion(model=MODEL, messages=judge_messages, response_format=AnswerEval)
+    # Retry logic for rate limits
+    for attempt in range(RATE_LIMIT_MAX_RETRIES):
+        try:
+            judge_response = completion(model=JUDGE_MODEL, messages=judge_messages)
+            break
+        except RateLimitError:
+            if attempt == RATE_LIMIT_MAX_RETRIES - 1:
+                raise
+            time.sleep(RATE_LIMIT_RETRY_DELAY)
 
-    answer_eval = AnswerEval.model_validate_json(judge_response.choices[0].message.content)
+    # Extract content and parse JSON
+    content = judge_response.choices[0].message.content or "{}"
+    answer_eval = _parse_judge_json(content)
 
     return answer_eval, generated_answer, retrieved_docs
+
 
 
 def evaluate_all_retrieval():
@@ -170,9 +232,13 @@ def evaluate_all_retrieval():
         yield test, result, progress
 
 
-def evaluate_all_answers():
-    """Evaluate all answers to tests using batched async execution."""
+def evaluate_all_answers(test_indices: list[int] | None = None):
+    """Evaluate answers. If test_indices is set, run only those tests (e.g. [0] for one test)."""
     tests = load_tests()
+    if test_indices is not None:
+        tests = [tests[i] for i in test_indices if 0 <= i < len(tests)]
+        if not tests:
+            return
     total_tests = len(tests)
     for index, test in enumerate(tests):
         result = evaluate_answer(test)[0]
